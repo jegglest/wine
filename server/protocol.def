@@ -1385,6 +1385,7 @@ struct cpu_topology_override
 /* Close a handle for the current process */
 @REQ(close_handle)
     obj_handle_t handle;       /* handle to close */
+    unsigned int inproc_serial; /* if nonzero, keep the in-process sync (still used by another thread) under this serial */
 @END
 
 
@@ -1406,6 +1407,7 @@ struct cpu_topology_override
     unsigned int access;       /* wanted access rights */
     unsigned int attributes;   /* object attributes */
     unsigned int options;      /* duplicate options */
+    unsigned int inproc_serial; /* as for close_handle, when closing the source */
 @REPLY
     obj_handle_t handle;       /* duplicated handle in dst process */
 @END
@@ -4359,4 +4361,11 @@ enum fsync_type
 @REQ(fsync_free_shm_idx)
     unsigned int shm_idx;
 @REPLY
+@END
+
+
+/* Stop keeping an in-process sync that close_handle / dup_handle kept: its last user is done.
+ * Appended after every other request so that existing request numbers stay the same. */
+@REQ(release_inproc_sync)
+    unsigned int serial;        /* serial given to close_handle / dup_handle */
 @END

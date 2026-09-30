@@ -1863,6 +1863,8 @@ NTSTATUS WINAPI NtAllocateReserveObject( HANDLE *handle, const OBJECT_ATTRIBUTES
 NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE dest_process, HANDLE *dest,
                                    ACCESS_MASK access, ULONG attributes, ULONG options )
 {
+    struct inproc_sync *cache = NULL;
+    unsigned int serial = 0;
     sigset_t sigset;
     unsigned int ret;
     int fd = -1;
@@ -1899,7 +1901,7 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
     if (options & DUPLICATE_CLOSE_SOURCE)
     {
         fd = remove_fd_from_cache( source );
-        close_inproc_sync( source );
+        cache = close_inproc_sync_begin( source, &serial );
     }
 
     SERVER_START_REQ( dup_handle )
@@ -1910,12 +1912,14 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
         req->access      = access;
         req->attributes  = attributes;
         req->options     = options;
+        req->inproc_serial = serial;
         if (!(ret = wine_server_call( req )))
         {
             if (dest) *dest = wine_server_ptr_handle( reply->handle );
         }
     }
     SERVER_END_REQ;
+    if (cache) close_inproc_sync_end( cache, serial );
 
     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
 
@@ -1958,6 +1962,8 @@ NTSTATUS WINAPI NtCompareTokens( HANDLE first, HANDLE second, BOOLEAN *equal )
  */
 NTSTATUS WINAPI NtClose( HANDLE handle )
 {
+    struct inproc_sync *cache;
+    unsigned int serial;
     sigset_t sigset;
     HANDLE port;
     unsigned int ret;
@@ -1973,14 +1979,16 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     /* always remove the cached fd; if the server request fails we'll just
      * retrieve it again */
     fd = remove_fd_from_cache( handle );
-    close_inproc_sync( handle );
+    cache = close_inproc_sync_begin( handle, &serial );
 
     SERVER_START_REQ( close_handle )
     {
         req->handle = wine_server_obj_handle( handle );
+        req->inproc_serial = serial;
         ret = wine_server_call( req );
     }
     SERVER_END_REQ;
+    if (cache) close_inproc_sync_end( cache, serial );
 
     server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
 
