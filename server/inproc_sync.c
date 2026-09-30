@@ -107,6 +107,20 @@ static void prune_orphan_mutexes(void)
     }
 }
 
+/* In-process syncs whose handle a process closed while one of its threads was still using the cached fd
+ * (typically a wait in progress). That thread can still acquire the mutex through the fd, so the server keeps
+ * the object, and with it the mutex's place on inproc_mutexes, until the client reports that the last user is
+ * done, or the process dies. */
+struct detached_sync
+{
+    struct list         entry;
+    struct process     *process;  /* process that closed the handle; the record dies with it */
+    unsigned int        serial;   /* id chosen by the client, unique within the process */
+    struct inproc_sync *sync;     /* the reference this record holds */
+};
+
+static struct list detached_syncs = LIST_INIT( detached_syncs );
+
 static void inproc_sync_dump( struct object *obj, int verbose );
 static int inproc_sync_signal( struct object *obj, unsigned int access, int signal );
 static void inproc_sync_destroy( struct object *obj );
@@ -328,6 +342,52 @@ void abandon_inproc_mutexes( thread_id_t tid )
     prune_orphan_mutexes();
 }
 
+void detach_inproc_sync( struct process *process, struct object *obj, unsigned int serial )
+{
+    struct object *sync;
+    struct detached_sync *detached;
+
+    if (!(sync = get_obj_sync( obj ))) return;
+    if (sync->ops == &inproc_sync_ops && ((struct inproc_sync *)sync)->type == INPROC_SYNC_MUTEX
+        && (detached = malloc( sizeof(*detached) )))
+    {
+        detached->process = process;
+        detached->serial  = serial;
+        detached->sync    = (struct inproc_sync *)sync;  /* keeps the reference from get_obj_sync() */
+        list_add_tail( &detached_syncs, &detached->entry );
+        return;
+    }
+    release_object( sync );
+}
+
+unsigned int release_detached_inproc_sync( struct process *process, unsigned int serial )
+{
+    struct detached_sync *detached;
+
+    LIST_FOR_EACH_ENTRY( detached, &detached_syncs, struct detached_sync, entry )
+    {
+        if (detached->process != process || detached->serial != serial) continue;
+        list_remove( &detached->entry );
+        release_object( detached->sync );
+        free( detached );
+        return STATUS_SUCCESS;
+    }
+    return STATUS_INVALID_PARAMETER;
+}
+
+void release_process_inproc_syncs( struct process *process )
+{
+    struct detached_sync *detached, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( detached, next, &detached_syncs, struct detached_sync, entry )
+    {
+        if (detached->process != process) continue;
+        list_remove( &detached->entry );
+        release_object( detached->sync );
+        free( detached );
+    }
+}
+
 static int get_obj_inproc_sync( struct object *obj, int *type )
 {
     struct object *sync;
@@ -389,6 +449,19 @@ void abandon_inproc_mutexes( thread_id_t tid )
 {
 }
 
+void detach_inproc_sync( struct process *process, struct object *obj, unsigned int serial )
+{
+}
+
+unsigned int release_detached_inproc_sync( struct process *process, unsigned int serial )
+{
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+void release_process_inproc_syncs( struct process *process )
+{
+}
+
 static int get_obj_inproc_sync( struct object *obj, int *type )
 {
     return -1;
@@ -410,4 +483,9 @@ DECL_HANDLER(get_inproc_sync_fd)
     else send_client_fd( current->process, fd, req->handle );
 
     release_object( obj );
+}
+
+DECL_HANDLER(release_inproc_sync)
+{
+    set_error( release_detached_inproc_sync( current->process, req->serial ) );
 }

@@ -255,6 +255,9 @@ extern struct inproc_sync *create_inproc_event_sync( int manual, int signaled );
 extern struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max );
 extern struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int count );
 extern void abandon_inproc_mutexes( thread_id_t owner );
+extern void detach_inproc_sync( struct process *process, struct object *obj, unsigned int serial );
+extern unsigned int release_detached_inproc_sync( struct process *process, unsigned int serial );
+extern void release_process_inproc_syncs( struct process *process );
 extern void signal_inproc_sync( struct inproc_sync *sync );
 extern void reset_inproc_sync( struct inproc_sync *sync );
 
