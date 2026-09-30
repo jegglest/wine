@@ -615,6 +615,85 @@ static void test_wait_on_address(void)
     ok(address == 0, "got %s\n", wine_dbgstr_longlong(address));
 }
 
+struct wait_on_address_waker
+{
+    LONG address;
+    volatile LONG stop;
+    BOOL wake_all;
+};
+
+static DWORD WINAPI wait_on_address_waker_thread( void *arg )
+{
+    struct wait_on_address_waker *waker = arg;
+
+    while (!waker->stop)
+    {
+        if (waker->wake_all) pRtlWakeAddressAll( &waker->address );
+        else pRtlWakeAddressSingle( &waker->address );
+    }
+    return 0;
+}
+
+static void test_wait_on_address_raced_wake(void)
+{
+    static const LONGLONG timeouts[] = {0, -1};
+    static const LARGE_INTEGER zero;
+    struct wait_on_address_waker waker;
+    unsigned int i, count, pending, early, failed;
+    LARGE_INTEGER timeout;
+    LONG compare = 0, other = 0;
+    NTSTATUS status;
+    HANDLE thread;
+    DWORD start;
+
+    if (!pRtlWaitOnAddress)
+    {
+        win_skip("RtlWaitOnAddress not supported, skipping test\n");
+        return;
+    }
+
+    /* A wake that races the end of a short wait may be taken by that wait, but it must not leave an alert
+     * pending on the thread, which would end its next wait on anything early. */
+    for (i = 0; i < ARRAY_SIZE(timeouts) * 2; i++)
+    {
+        winetest_push_context( "timeout %s, %s", wine_dbgstr_longlong( timeouts[i / 2] ),
+                               i % 2 ? "wake all" : "wake single" );
+
+        waker.address = 0;
+        waker.stop = 0;
+        waker.wake_all = i % 2;
+        thread = CreateThread( NULL, 0, wait_on_address_waker_thread, &waker, 0, NULL );
+
+        pending = early = failed = 0;
+        start = GetTickCount();
+        for (count = 0; count < 20000 && GetTickCount() - start < 1000; count++)
+        {
+            timeout.QuadPart = timeouts[i / 2];
+            status = pRtlWaitOnAddress( &waker.address, &compare, sizeof(compare), &timeout );
+            if (status != STATUS_SUCCESS && status != STATUS_TIMEOUT) failed++;
+
+            if (pNtWaitForAlertByThreadId)
+            {
+                if (pNtWaitForAlertByThreadId( NULL, &zero ) == STATUS_ALERTED) pending++;
+            }
+            else
+            {
+                timeout.QuadPart = -1;
+                if (pRtlWaitOnAddress( &other, &compare, sizeof(compare), &timeout ) != STATUS_TIMEOUT) early++;
+            }
+        }
+
+        waker.stop = 1;
+        WaitForSingleObject( thread, INFINITE );
+        CloseHandle( thread );
+
+        ok( !failed, "%u of %u waits failed\n", failed, count );
+        ok( !pending, "%u of %u waits left an alert pending\n", pending, count );
+        ok( !early, "%u of %u waits on another address returned early\n", early, count );
+        winetest_pop_context();
+    }
+}
+
 static HANDLE thread_ready, thread_done;
 
 static DWORD WINAPI resource_shared_thread(void *arg)
@@ -1474,6 +1553,7 @@ START_TEST(sync)
     pRtlBarrier                     = (void *)GetProcAddress(module, "RtlBarrier");
 
     test_wait_on_address();
+    test_wait_on_address_raced_wake();
     test_event();
     test_mutant();
     test_semaphore();
