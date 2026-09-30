@@ -23,6 +23,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -74,6 +75,37 @@ struct inproc_sync
 };
 
 static struct list inproc_mutexes = LIST_INIT( inproc_mutexes );
+
+/* Mutexes whose server object was destroyed while a thread still owned them. A client can still hold
+ * a duplicate of the fd (a thread waiting on a handle that has since been closed), and the ntsync
+ * driver abandons a mutex only through NTSYNC_IOC_MUTEX_KILL on that mutex, so the fd is kept until
+ * the owner has released or abandoned it. */
+struct orphan_mutex
+{
+    struct list entry;
+    int         fd;
+};
+
+static struct list orphan_mutexes = LIST_INIT( orphan_mutexes );
+
+static int inproc_mutex_owned( int fd )
+{
+    struct ntsync_mutex_args args = {0};
+    return !ioctl( fd, NTSYNC_IOC_MUTEX_READ, &args ) && args.owner;
+}
+
+static void prune_orphan_mutexes(void)
+{
+    struct orphan_mutex *orphan, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( orphan, next, &orphan_mutexes, struct orphan_mutex, entry )
+    {
+        if (inproc_mutex_owned( orphan->fd )) continue;
+        list_remove( &orphan->entry );
+        close( orphan->fd );
+        free( orphan );
+    }
+}
 
 static void inproc_sync_dump( struct object *obj, int verbose );
 static int inproc_sync_signal( struct object *obj, unsigned int access, int signal );
@@ -262,12 +294,25 @@ static void inproc_sync_destroy( struct object *obj )
     assert( obj->ops == &inproc_sync_ops );
     list_remove( &sync->entry );
     if (do_fsync()) fsync_free_shm_idx( sync->fd );
-    else            close( sync->fd );
+    else if (sync->type == INPROC_SYNC_MUTEX && inproc_mutex_owned( sync->fd ))
+    {
+        struct orphan_mutex *orphan;
+
+        prune_orphan_mutexes();
+        if ((orphan = malloc( sizeof(*orphan) )))
+        {
+            orphan->fd = sync->fd;
+            list_add_tail( &orphan_mutexes, &orphan->entry );
+        }
+        else close( sync->fd );
+    }
+    else close( sync->fd );
 }
 
 void abandon_inproc_mutexes( thread_id_t tid )
 {
     struct inproc_sync *mutex;
+    struct orphan_mutex *orphan;
 
     if (do_fsync())
     {
@@ -278,6 +323,9 @@ void abandon_inproc_mutexes( thread_id_t tid )
 
     LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
         ioctl( mutex->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
+    LIST_FOR_EACH_ENTRY( orphan, &orphan_mutexes, struct orphan_mutex, entry )
+        ioctl( orphan->fd, NTSYNC_IOC_MUTEX_KILL, &tid );
+    prune_orphan_mutexes();
 }
 
 static int get_obj_inproc_sync( struct object *obj, int *type )
