@@ -670,7 +670,15 @@ unsigned int get_handle_table_count( struct process *process )
 /* close a handle */
 DECL_HANDLER(close_handle)
 {
-    unsigned int err = close_handle( current->process, req->handle );
+    struct object *obj;
+    unsigned int err;
+
+    if (req->inproc_serial && (obj = get_handle_obj( current->process, req->handle, 0, NULL )))
+    {
+        detach_inproc_sync( current->process, obj, req->inproc_serial );
+        release_object( obj );
+    }
+    err = close_handle( current->process, req->handle );
     set_error( err );
 }
 
@@ -701,7 +709,17 @@ DECL_HANDLER(dup_handle)
         }
         /* close the handle no matter what happened */
         if ((req->options & DUPLICATE_CLOSE_SOURCE) && (src != dst || req->src_handle != reply->handle))
+        {
+            struct object *obj;
+
+            if (req->inproc_serial && src == current->process
+                && (obj = get_handle_obj( src, req->src_handle, 0, NULL )))
+            {
+                detach_inproc_sync( src, obj, req->inproc_serial );
+                release_object( obj );
+            }
             close_handle( src, req->src_handle );
+        }
         release_object( src );
     }
 }

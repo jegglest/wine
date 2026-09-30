@@ -418,6 +418,9 @@ extern NTSTATUS wow64_wine_spawnvp( void *args );
 
 extern void dbg_init(void);
 
+struct inproc_sync;
+extern struct inproc_sync *close_inproc_sync_begin( HANDLE handle, unsigned int *serial );
+extern void close_inproc_sync_end( struct inproc_sync *cache, unsigned int serial );
 extern void close_inproc_sync( HANDLE handle );
 
 extern NTSTATUS call_user_apc_dispatcher( CONTEXT *context_ptr, unsigned int flags, ULONG_PTR arg1, ULONG_PTR arg2,

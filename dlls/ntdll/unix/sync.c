@@ -542,9 +542,14 @@ struct inproc_sync
     unsigned int   access;    /* handle access rights */
     unsigned short type;      /* enum inproc_sync_type as short to save space */
     unsigned short closed;    /* fd has been closed but sync is still referenced */
+    unsigned int   serial;    /* id of this cache entry for the server, 0 if not cached */
 };
 
-#define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
+static LONG next_inproc_sync_serial;
+
+/* a cache block is 64K, a multiple of any host page size; the entries need not fill it */
+#define INPROC_SYNC_CACHE_BLOCK_BYTES 65536
+#define INPROC_SYNC_CACHE_BLOCK_SIZE  (INPROC_SYNC_CACHE_BLOCK_BYTES / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128
 
 static struct inproc_sync *inproc_sync_cache[INPROC_SYNC_CACHE_ENTRIES];
@@ -582,8 +587,8 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
         if (!entry) inproc_sync_cache[0] = inproc_sync_cache_initial_block;
         else
         {
-            static const size_t size = INPROC_SYNC_CACHE_BLOCK_SIZE * sizeof(struct inproc_sync);
-            void *ptr = anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
+            /* map the whole block: mmap() needs whole pages, and the entries don't fill it exactly */
+            void *ptr = anon_mmap_alloc( INPROC_SYNC_CACHE_BLOCK_BYTES, PROT_READ | PROT_WRITE );
             if (ptr == MAP_FAILED) return sync;
             inproc_sync_cache[entry] = ptr;
         }
@@ -604,6 +609,7 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
     cache->access = sync->access;
     cache->type = sync->type;
     cache->closed = sync->closed;
+    while (!(cache->serial = InterlockedIncrement( &next_inproc_sync_serial ))) ;
     /* Make sure we set the other members before the refcount; this store needs
      * release semantics [paired with the load in get_cached_inproc_sync()].
      * Set the refcount to 2 (one for the handle, one for the caller). */
@@ -628,15 +634,31 @@ static inline LONG interlocked_inc_if_nonzero( LONG *dest )
     return val;
 }
 
+static void release_detached_inproc_sync( unsigned int serial )
+{
+    SERVER_START_REQ( release_inproc_sync )
+    {
+        req->serial = serial;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+}
+
 static void release_inproc_sync( struct inproc_sync *sync )
 {
-    /* save the fd now; as soon as the refcount hits 0 we cannot
+    /* save the fd and serial now; as soon as the refcount hits 0 we cannot
      * access the cache anymore */
     int fd = sync->fd;
+    unsigned int serial = sync->serial;
     LONG ref = InterlockedDecrement( &sync->refcount );
 
     assert( ref >= 0 );
-    if (!ref) close( fd );
+    if (ref) return;
+    close( fd );
+    /* The handle was closed while the object was in use (NtClose() drops the
+     * handle's reference last), and close_inproc_sync_begin() had the server
+     * keep the object under this serial: let it go now. */
+    if (serial) release_detached_inproc_sync( serial );
 }
 
 static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
@@ -682,6 +704,7 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
             sync->access = reply->access;
             sync->type = reply->type;
             sync->closed = 0;
+            sync->serial = 0;
         }
     }
     SERVER_END_REQ;
@@ -761,23 +784,47 @@ extern NTSTATUS check_signal_access( struct inproc_sync *sync )
 }
 
 /* caller must hold fd_cache_mutex */
-void close_inproc_sync( HANDLE handle )
+/* First half of closing a handle, before the server request: drop the cache
+ * entry and find out whether another thread is still using the object.
+ * Returns the entry, with a reference held, for close_inproc_sync_end(). */
+struct inproc_sync *close_inproc_sync_begin( HANDLE handle, unsigned int *serial )
 {
     struct inproc_sync *cache;
 
+    *serial = 0;
     if (do_fsync())
     {
         fsync_close( handle );
-        return;
+        return NULL;
     }
-    if (inproc_device_fd < 0) return;
-    if ((cache = get_cached_inproc_sync( handle )))
-    {
-        cache->closed = 1;
-        /* once for the reference we just grabbed, and once for the handle */
-        release_inproc_sync( cache );
-        release_inproc_sync( cache );
-    }
+    if (inproc_device_fd < 0) return NULL;
+    if (!(cache = get_cached_inproc_sync( handle ))) return NULL;
+    cache->closed = 1;
+    /* One reference is the handle's and one is ours; any more belong to
+     * threads in the middle of an operation, typically a wait. Such a thread
+     * can still acquire a mutex through the fd, and the server must then know
+     * the mutex to abandon it if the thread dies, so have the server keep the
+     * object under this entry's serial until the last user releases it. */
+    if (cache->type == INPROC_SYNC_MUTEX && InterlockedCompareExchange( &cache->refcount, 0, 0 ) > 2)
+        *serial = cache->serial;
+    return cache;
+}
+
+/* Second half, after the server request; serial is what the request carried, or 0 */
+void close_inproc_sync_end( struct inproc_sync *cache, unsigned int serial )
+{
+    cache->serial = serial;
+    /* once for the reference we grabbed, and once for the handle */
+    release_inproc_sync( cache );
+    release_inproc_sync( cache );
+}
+
+void close_inproc_sync( HANDLE handle )
+{
+    struct inproc_sync *cache;
+    unsigned int serial;
+
+    if ((cache = close_inproc_sync_begin( handle, &serial ))) close_inproc_sync_end( cache, 0 );
 }
 
 static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
