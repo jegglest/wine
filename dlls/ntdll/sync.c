@@ -909,8 +909,9 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 
     ret = NtWaitForAlertByThreadId( NULL, timeout );
 
-    /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). */
-    if (entry.addr)
+    /* We may have already been removed by a call to RtlWakeAddressSingle() or RtlWakeAddressAll(). They clear
+     * the address last, with release semantics: once it is NULL the waker is done with the entry. */
+    if (ReadPointerAcquire( (void * const volatile *)&entry.addr ))
     {
         spin_lock( &queue->lock );
         if (entry.addr)
@@ -947,14 +948,17 @@ void WINAPI RtlWakeAddressAll( const void *addr )
     {
         if (entry->addr == addr)
         {
-            entry->addr = NULL;
-            list_remove( &entry->entry );
             if (count == ARRAY_SIZE(tids))
             {
                 NtAlertMultipleThreadByThreadId( tids, count, NULL, NULL );
                 count = 0;
             }
             tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
+            list_remove( &entry->entry );
+
+            /* The entry is on the waiter's stack, and the waiter may return as soon as it sees the address
+             * cleared, so this must be our last access to it. */
+            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
         }
     }
 
@@ -994,8 +998,11 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
             /* Remove this entry from the queue, so that a simultaneous call to
              * RtlWakeAddressSingle() will not also wake it—two simultaneous
              * calls must wake at least two waiters if they exist. */
-            entry->addr = NULL;
             list_remove( &entry->entry );
+
+            /* The entry is on the waiter's stack, and the waiter may return as soon as it sees the address
+             * cleared, so this must be our last access to it. */
+            WritePointerRelease( (void * volatile *)&entry->addr, NULL );
             break;
         }
     }
