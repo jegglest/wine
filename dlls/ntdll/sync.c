@@ -168,6 +168,97 @@ static inline HANDLE get_semaphore( RTL_CRITICAL_SECTION *crit )
     return NULL;
 }
 
+/* HACK: when set, a thread woken from RtlWaitOnAddress() by a thread that holds a critical section on the woken
+ * thread's stack waits until the waker is done with that critical section before it returns: it would otherwise
+ * be free to return and reuse the frame while the waker is still leaving the critical section in it. Helldivers 2's
+ * renderer thread loses that race against its D3D12TaskDispatcherThread. */
+BOOL cs_wake_guard = FALSE;
+
+/* The critical sections the thread holds while cs_wake_guard is set, in a TEB field Wine doesn't use otherwise.
+ * Those taken beyond the size of the list are not tracked. */
+struct held_crit_sections
+{
+    RTL_CRITICAL_SECTION *leaving;  /* the one RtlLeaveCriticalSection() is releasing, for the threads we woke */
+    ULONG_PTR count;
+    RTL_CRITICAL_SECTION *crit[14];
+};
+C_ASSERT( sizeof(struct held_crit_sections) <= sizeof(((TEB *)0)->ReservedForDebuggerInstrumentation) );
+
+static inline struct held_crit_sections *get_held_crit_sections(void)
+{
+    return (struct held_crit_sections *)NtCurrentTeb()->ReservedForDebuggerInstrumentation;
+}
+
+static void add_held_crit_section( RTL_CRITICAL_SECTION *crit )
+{
+    struct held_crit_sections *held = get_held_crit_sections();
+
+    if (held->count < ARRAY_SIZE(held->crit)) held->crit[held->count++] = crit;
+}
+
+static void remove_held_crit_section( RTL_CRITICAL_SECTION *crit )
+{
+    struct held_crit_sections *held = get_held_crit_sections();
+    ULONG_PTR i;
+
+    for (i = held->count; i--;)
+    {
+        if (held->crit[i] != crit) continue;
+        held->crit[i] = held->crit[--held->count];
+        return;
+    }
+}
+
+/* The critical section in [start, end), if any, that this thread holds. */
+static RTL_CRITICAL_SECTION *find_held_crit_section( const void *start, const void *end )
+{
+    struct held_crit_sections *held = get_held_crit_sections();
+    ULONG_PTR i;
+
+    for (i = 0; i < held->count; i++)
+    {
+        RTL_CRITICAL_SECTION *crit = held->crit[i];
+
+        if ((const char *)crit < (const char *)start || (const char *)crit >= (const char *)end) continue;
+        if (crit->OwningThread == ULongToHandle(GetCurrentThreadId())) return crit;
+    }
+    return NULL;
+}
+
+/* Whether thread tid, whose list is held, is done with crit: it no longer owns it and isn't still leaving it.
+ * RtlLeaveCriticalSection() sets held->leaving before it clears OwningThread and resets it after its last access. */
+static BOOL crit_section_released( RTL_CRITICAL_SECTION *crit, DWORD tid, const struct held_crit_sections *held )
+{
+    if (ReadPointerAcquire( (void * const volatile *)&crit->OwningThread ) == ULongToHandle(tid)) return FALSE;
+    return ReadPointerAcquire( (void * const volatile *)&held->leaving ) != crit;
+}
+
+/* Wait, for at most a few tens of milliseconds, until thread tid is done with a critical section on our stack. */
+static void wait_for_crit_section_release( RTL_CRITICAL_SECTION *crit, DWORD tid,
+                                           const struct held_crit_sections *held )
+{
+    static const LARGE_INTEGER delay = {.QuadPart = -1000}; /* 100 µs */
+    static LONG warned;
+    unsigned int i;
+
+    for (i = 0; !crit_section_released( crit, tid, held ); i++)
+    {
+        if (i < 64) YieldProcessor();
+        else if (i < 128) NtYieldExecution();
+        else if (i < 128 + 200) NtDelayExecution( FALSE, &delay );
+        else
+        {
+            if (!InterlockedExchange( &warned, 1 ))
+                ERR( "section %p %s still held by %04lx, returning\n", crit,
+                     debugstr_a( crit_section_get_name( crit )), tid );
+            break;
+        }
+    }
+}
+
+static NTSTATUS wait_on_address( const void *addr, const void *cmp, SIZE_T size,
+                                 const LARGE_INTEGER *timeout, BOOL guard );
+
 static inline NTSTATUS wait_semaphore( RTL_CRITICAL_SECTION *crit, int timeout )
 {
     LARGE_INTEGER time = {.QuadPart = timeout * (LONGLONG)-10000000};
@@ -181,7 +272,7 @@ static inline NTSTATUS wait_semaphore( RTL_CRITICAL_SECTION *crit, int timeout )
         {
             static const LONG zero;
             /* this may wait longer than specified in case of multiple wake-ups */
-            if (RtlWaitOnAddress( lock, &zero, sizeof(LONG), &time ) == STATUS_TIMEOUT)
+            if (wait_on_address( lock, &zero, sizeof(LONG), &time, FALSE ) == STATUS_TIMEOUT)
                 return STATUS_TIMEOUT;
         }
         return STATUS_WAIT_0;
@@ -383,6 +474,7 @@ NTSTATUS WINAPI RtlEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
 done:
     crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
     crit->RecursionCount = 1;
+    if (cs_wake_guard) add_held_crit_section( crit );
     return STATUS_SUCCESS;
 }
 
@@ -397,6 +489,7 @@ BOOL WINAPI RtlTryEnterCriticalSection( RTL_CRITICAL_SECTION *crit )
     {
         crit->OwningThread   = ULongToHandle(GetCurrentThreadId());
         crit->RecursionCount = 1;
+        if (cs_wake_guard) add_held_crit_section( crit );
         ret = TRUE;
     }
     else if (crit->OwningThread == ULongToHandle(GetCurrentThreadId()))
@@ -440,11 +533,23 @@ NTSTATUS WINAPI RtlLeaveCriticalSection( RTL_CRITICAL_SECTION *crit )
     }
     else
     {
-        crit->OwningThread = 0;
+        struct held_crit_sections *held = cs_wake_guard ? get_held_crit_sections() : NULL;
+
+        if (held)
+        {
+            held->leaving = crit;
+            WritePointerRelease( (void * volatile *)&crit->OwningThread, NULL );
+        }
+        else crit->OwningThread = 0;
         if (InterlockedDecrement( &crit->LockCount ) >= 0)
         {
             /* someone is waiting */
             RtlpUnWaitCriticalSection( crit );
+        }
+        if (held)
+        {
+            remove_held_crit_section( crit );
+            WritePointerRelease( (void * volatile *)&held->leaving, NULL );
         }
     }
     return STATUS_SUCCESS;
@@ -828,6 +933,10 @@ struct futex_entry
     struct list entry;
     const void *addr;
     DWORD tid;
+    void *stack_base;                       /* top of the waiter's stack, if it guards against cs_wake_guard's race */
+    RTL_CRITICAL_SECTION *held;             /* critical section on the waiter's stack that the waker holds */
+    const struct held_crit_sections *waker; /* the waker's list, and its thread id */
+    DWORD waker_tid;
 };
 
 struct futex_queue
@@ -873,11 +982,17 @@ static BOOL compare_addr( const void *addr, const void *cmp, SIZE_T size )
     return FALSE;
 }
 
-/***********************************************************************
- *           RtlWaitOnAddress   (NTDLL.@)
- */
-NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size,
-                                  const LARGE_INTEGER *timeout )
+/* Called by the waker: note the critical section on the waiter's stack, if any, that we hold. */
+static void note_held_crit_section( struct futex_entry *entry )
+{
+    if (!entry->stack_base || !get_held_crit_sections()->count) return;
+    if (!(entry->held = find_held_crit_section( entry, entry->stack_base ))) return;
+    entry->waker = get_held_crit_sections();
+    entry->waker_tid = GetCurrentThreadId();
+}
+
+static NTSTATUS wait_on_address( const void *addr, const void *cmp, SIZE_T size,
+                                 const LARGE_INTEGER *timeout, BOOL guard )
 {
     struct futex_queue *queue = get_futex_queue( addr );
     struct futex_entry entry;
@@ -891,6 +1006,8 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
 
     entry.addr = addr;
     entry.tid = GetCurrentThreadId();
+    entry.stack_base = guard ? NtCurrentTeb()->Tib.StackBase : NULL;
+    entry.held = NULL;
 
     spin_lock( &queue->lock );
 
@@ -929,10 +1046,22 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
         ret = STATUS_SUCCESS;
     }
 
+    /* Our waker set entry.held before clearing the address, so we see it either way. */
+    if (!queued && entry.held) wait_for_crit_section_release( entry.held, entry.waker_tid, entry.waker );
+
     TRACE("returning %#lx\n", ret);
 
     if (ret == STATUS_ALERTED) ret = STATUS_SUCCESS;
     return ret;
+}
+
+/***********************************************************************
+ *           RtlWaitOnAddress   (NTDLL.@)
+ */
+NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size,
+                                  const LARGE_INTEGER *timeout )
+{
+    return wait_on_address( addr, cmp, size, timeout, cs_wake_guard );
 }
 
 /***********************************************************************
@@ -965,6 +1094,7 @@ void WINAPI RtlWakeAddressAll( const void *addr )
             }
             tids[count++] = (HANDLE)(ULONG_PTR)entry->tid;
             list_remove( &entry->entry );
+            note_held_crit_section( entry );
 
             /* The entry is on the waiter's stack, and the waiter may return as soon as it sees the address
              * cleared, so this must be our last access to it. */
@@ -1009,6 +1139,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
              * RtlWakeAddressSingle() will not also wake it—two simultaneous
              * calls must wake at least two waiters if they exist. */
             list_remove( &entry->entry );
+            note_held_crit_section( entry );
 
             /* The entry is on the waiter's stack, and the waiter may return as soon as it sees the address
              * cleared, so this must be our last access to it. */

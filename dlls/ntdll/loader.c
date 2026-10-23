@@ -4692,6 +4692,18 @@ void loader_init( CONTEXT *context, void **entry )
             InitializeListHead( &hash_table[i] );
 
         init_user_process_params();
+
+        if (get_env( L"WINE_CS_WAKE_GUARD", env_str, sizeof(env_str) ))
+            cs_wake_guard = env_str[0] == L'1';
+        else
+        {
+            const WCHAR *name = peb->ProcessParameters->ImagePathName.Buffer, *p;
+
+            if (name && (p = wcsrchr( name, '\\' ))) name = p + 1;
+            cs_wake_guard = name && !wcsicmp( name, L"helldivers2.exe" );
+        }
+        if (cs_wake_guard) ERR( "HACK: Enabling critical section wake guard.\n" );
+
         load_global_options();
         version_init();
         open_known_dll_ntdir();
